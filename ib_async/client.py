@@ -18,6 +18,30 @@ from .decoder import Decoder
 from .objects import ConnectionStats, WshEventData
 from .util import UNSET_DOUBLE, UNSET_INTEGER, dataclassAsTuple, getLoop, run
 
+# The protocol has no escape mechanism: NUL separates fields, and inside a
+# tag-value list field ';' separates pairs and '=' separates tag from value.
+_TAG_VALUE_RESERVED = (";", "=", "\0")
+
+
+def _checkField(s: str) -> str:
+    if "\0" in s:
+        raise ValueError(f"Field must not contain a NUL character: {s!r}")
+    return s
+
+
+def _formatTagValues(tagValues) -> str:
+    parts = []
+    for tv in tagValues:
+        tag = str(tv.tag)
+        value = str(tv.value)
+        for kind, text in (("tag", tag), ("value", value)):
+            if any(c in text for c in _TAG_VALUE_RESERVED):
+                raise ValueError(
+                    f"TagValue {kind} must not contain ';', '=' or NUL: {text!r}"
+                )
+        parts.append(f"{tag}={value};")
+    return "".join(parts)
+
 
 class Client:
     """
@@ -254,7 +278,7 @@ class Client:
         FORMAT_HANDLERS: dict[Any, Callable[[Any], str]] = {
             # Contracts are formatted in IBKR null delimiter format
             Contract: lambda c: "\0".join([
-                str(f)
+                _checkField(str(f))
                 for f in (
                     c.conId,
                     c.symbol,
@@ -295,7 +319,8 @@ class Client:
             bool: lambda b: "1" if b else "0",
 
             # Lists of tags become semicolon-appended KV pairs
-            list: lambda lst: "".join([f"{v.tag}={v.value};" for v in lst]),
+            list: _formatTagValues,
+            tuple: _formatTagValues,
         }
         # fmt: on
 
@@ -306,12 +331,13 @@ class Client:
             # Fetch type converter for this field (falls back to 'str(field)' as a default for unmatched types)
             # (extra `isinstance()` wrapper needed here because Contract subclasses are their own type, but we want
             #  to only match against the Contract parent class for formatting operations)
-            convert = FORMAT_HANDLERS.get(
-                Contract if isinstance(field, Contract) else type(field), str
-            )
+            isContract = isinstance(field, Contract)
+            convert = FORMAT_HANDLERS.get(Contract if isContract else type(field), str)
 
             # Convert field to IBKR protocol string part
             s = convert(field)
+            if not isContract:
+                _checkField(s)
 
             # Append converted IBKR protocol string to message buffer
             msg.write(s)
