@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import os
 import sys
+import tempfile
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import ClassVar
@@ -30,6 +33,12 @@ class IBC:
         userid (str): IB account username. It is recommended to set the real
             username/password in a secured IBC config file.
         password (str): IB account password.
+
+            Credentials given here are never put on the IBC command line.
+            They are written, together with the contents of ``ibcIni``
+            (or the IBC default config file), to a temporary config file
+            that only the current user can read. That file is passed to
+            IBC instead and is removed when IBC exits or is terminated.
         twsPath (str): Path to the TWS installation folder.
             Defaults:
 
@@ -103,6 +112,7 @@ class IBC:
             self.ibcPath = "/opt/ibc" if not self._isWindows else "C:\\IBC"
         self._proc = None
         self._monitor = None
+        self._credentialsIni = None
         self._logger = logging.getLogger("ib_async.IBC")
 
     def __enter__(self):
@@ -135,12 +145,22 @@ class IBC:
             ibcPath=("--ibc-path=", "/IbcPath:"),
             ibcIni=("--ibc-ini=", "/Config:"),
             javaPath=("--java-path=", "/JavaPath:"),
-            userid=("--user=", "/User:"),
-            password=("--pw=", "/PW:"),
-            fixuserid=("--fix-user=", "/FIXUser:"),
-            fixpassword=("--fix-pw=", "/FIXPW:"),
             on2fatimeout=("--on2fatimeout=", "/On2FATimeout:"),
         )
+
+        # The process command line is readable by every local user, so
+        # credentials are handed to IBC through a private config file.
+        values = util.dataclassAsDict(self)
+        credentials = {
+            setting: values.pop(field)
+            for field, setting in self._CredentialSettings.items()
+        }
+        credentials = {k: v for k, v in credentials.items() if v}
+        self._removeCredentialsIni()
+        if credentials:
+            iniPath = self._writeCredentialsIni(credentials)
+            self._credentialsIni = weakref.finalize(self, _removeFile, iniPath)
+            values["ibcIni"] = iniPath
 
         # create shell command
         cmd = [
@@ -150,7 +170,7 @@ class IBC:
                 else f"{self.ibcPath}/scripts/ibcstart.sh"
             )
         ]
-        for k, v in util.dataclassAsDict(self).items():
+        for k, v in values.items():
             arg = args[k][self._isWindows]
             if v:
                 if arg.endswith("=") or arg.endswith(":"):
@@ -161,10 +181,70 @@ class IBC:
                     cmd.append(str(v))
 
         # run shell command
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE
-        )
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE
+            )
+        except BaseException:
+            self._removeCredentialsIni()
+            raise
         self._monitor = asyncio.ensure_future(self.monitorAsync())
+
+    # map from credential field names to IBC config file settings
+    _CredentialSettings: ClassVar = dict(
+        userid="IbLoginId",
+        password="IbPassword",
+        fixuserid="FIXLoginId",
+        fixpassword="FIXPassword",
+    )
+
+    def _baseIniPath(self) -> str:
+        if self.ibcIni:
+            return self.ibcIni
+        if self._isWindows:
+            home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+            return os.path.join(home, "Documents", "IBC", "config.ini")
+        return os.path.expanduser("~/ibc/config.ini")
+
+    def _writeCredentialsIni(self, credentials: dict[str, str]) -> str:
+        """
+        Write a copy of the IBC config file with the given credential
+        settings appended to a new file that only the current user can
+        read, and return its path.
+        """
+        path = self._baseIniPath()
+        try:
+            with open(path, "rb") as f:
+                base = f.read()
+        except FileNotFoundError:
+            if self.ibcIni:
+                raise
+            base = b""
+
+        # IBC loads the file with java.util.Properties, where the
+        # last occurrence of a key wins. The empty line ends any line
+        # continuation left open at the end of the base file.
+        lines = [b"", b"", b"# credentials supplied by ib_async"]
+        for key, value in credentials.items():
+            lines.append(f"{key}={_escapePropertyValue(value)}".encode("ascii"))
+        content = base + b"\n".join(lines) + b"\n"
+
+        # mkstemp creates the file exclusively with mode 0600
+        fd, iniPath = tempfile.mkstemp(prefix="ib_async-ibc-", suffix=".ini")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+        except BaseException:
+            _removeFile(iniPath)
+            raise
+        return iniPath
+
+    def _removeCredentialsIni(self, finalizer=None):
+        finalizer = finalizer or self._credentialsIni
+        if finalizer:
+            finalizer()
+            if finalizer is self._credentialsIni:
+                self._credentialsIni = None
 
     async def terminateAsync(self):
         if not self._proc:
@@ -182,13 +262,44 @@ class IBC:
                 self._proc.terminate()
                 await self._proc.wait()
         self._proc = None
+        self._removeCredentialsIni()
 
     async def monitorAsync(self):
+        proc = self._proc
+        credentialsIni = self._credentialsIni
         while self._proc:
             line = await self._proc.stdout.readline()
             if not line:
                 break
             self._logger.log(IBC.IbcLogLevel, line.strip().decode())
+        if proc and credentialsIni:
+            await proc.wait()
+            self._removeCredentialsIni(credentialsIni)
+
+
+def _removeFile(path: str):
+    with suppress(OSError):
+        os.remove(path)
+
+
+def _escapePropertyValue(value: str) -> str:
+    """Escape a value for a java.util.Properties file (ISO-8859-1)."""
+    special = {"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r", "\f": "\\f"}
+    out = []
+    for i, c in enumerate(value):
+        if c in special:
+            out.append(special[c])
+        elif c == " " and i == 0:
+            out.append("\\ ")
+        elif c in "=:#!":
+            out.append("\\" + c)
+        elif " " <= c <= "~":
+            out.append(c)
+        else:
+            utf16 = c.encode("utf-16-be")
+            for j in range(0, len(utf16), 2):
+                out.append(f"\\u{utf16[j]:02x}{utf16[j + 1]:02x}")
+    return "".join(out)
 
 
 @dataclass
