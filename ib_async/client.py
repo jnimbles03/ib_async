@@ -67,6 +67,11 @@ class Client:
         ``RequestsInterval`` seconds. Set to 0 to disable throttling.
       RequestsInterval (float):
         Time interval (in seconds) for request throttling.
+      MaxMessageSize (int):
+        Largest length (in bytes) accepted in the 4-byte length prefix of
+        an incoming message. A message that declares a larger length is
+        refused and the connection is closed, before any of its body is
+        buffered.
       MinClientVersion (int):
         Client protocol version.
       MaxClientVersion (int):
@@ -84,6 +89,8 @@ class Client:
 
     MaxRequests = 45
     RequestsInterval = 1
+
+    MaxMessageSize = 8 * 1024 * 1024
 
     MinClientVersion = 157
     MaxClientVersion = 178
@@ -121,6 +128,7 @@ class Client:
         self._apiReady = False
         self._serverVersion = 0
         self._data = b""
+        self._discardInput = False
         self._hasReqId = False
         self._reqIdSeq = 0
         self._accounts = []
@@ -355,6 +363,9 @@ class Client:
         return struct.pack(">I", len(msg)) + msg
 
     def _onSocketHasData(self, data):
+        if self._discardInput:
+            return
+
         debug = self._logger.isEnabledFor(logging.DEBUG)
         if self._tcpDataArrived:
             self._tcpDataArrived()
@@ -363,12 +374,17 @@ class Client:
         self._numBytesRecv += len(data)
 
         while True:
-            if len(self._data) <= 4:
+            if len(self._data) < 4:
                 break
 
             # 4 byte prefix tells the message length
-            msgEnd = 4 + struct.unpack(">I", self._data[:4])[0]
-            if len(self._data) < msgEnd:
+            msgLen = struct.unpack(">I", self._data[:4])[0]
+            if msgLen > self.MaxMessageSize:
+                self._rejectOversizedMessage(msgLen)
+                break
+
+            msgEnd = 4 + msgLen
+            if len(self._data) <= 4 or len(self._data) < msgEnd:
                 # insufficient data for now
                 break
 
@@ -414,6 +430,20 @@ class Client:
 
         if self._tcpDataProcessed:
             self._tcpDataProcessed()
+
+    def _rejectOversizedMessage(self, msgLen: int):
+        # The connection is torn down without resetting client state, so that
+        # connection_lost runs the regular disconnect path (apiEnd etc.).
+        self._discardInput = True
+        self._data = b""
+        msg = (
+            f"Closing connection: incoming message length {msgLen} "
+            f"exceeds MaxMessageSize {self.MaxMessageSize}"
+        )
+        self._logger.error(msg)
+        self.apiError.emit(msg)
+        self.connState = Client.DISCONNECTED
+        self.conn.disconnect()
 
     def _onSocketDisconnected(self, msg):
         wasReady = self.isReady()
