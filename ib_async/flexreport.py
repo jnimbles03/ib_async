@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 import time
 import xml.etree.ElementTree as et
 from contextlib import suppress
@@ -151,8 +152,16 @@ class FlexReport:
 
 
 if __name__ == "__main__":
-    util.logToConsole()
-    report = FlexReport("945692423458902392892687", "272555")
-    print(report.topics())
-    trades = report.extract("Trade")
-    print(trades)
+    token = os.getenv("IB_FLEXREPORT_TOKEN")
+    queryId = os.getenv("IB_FLEXREPORT_QUERY_ID")
+    if token and queryId:
+        util.logToConsole()
+        report = FlexReport(token, queryId)
+        print(report.topics())
+        trades = report.extract("Trade")
+        print(trades)
+    else:
+        print(
+            "Set IB_FLEXREPORT_TOKEN and IB_FLEXREPORT_QUERY_ID to download a report.",
+            file=sys.stderr,
+        )
