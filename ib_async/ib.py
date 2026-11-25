@@ -797,6 +797,7 @@ class IB:
             assert trade.orderStatus.status not in OrderStatus.DoneStates
             logEntry = TradeLogEntry(now, trade.orderStatus.status, "Modify")
             trade.log.append(logEntry)
+            trade._pendingRequests += 1
             self._logger.info(f"placeOrder: Modify order {trade}")
             trade.modifyEvent.emit(trade)
             self.orderModifyEvent.emit(trade)
@@ -838,6 +839,7 @@ class IB:
                     newStatus = OrderStatus.Cancelled
                 else:
                     newStatus = OrderStatus.PendingCancel
+                    trade._pendingRequests += 1
 
                 logEntry = TradeLogEntry(now, newStatus)
                 trade.log.append(logEntry)
