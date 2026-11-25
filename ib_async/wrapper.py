@@ -691,6 +691,8 @@ class Wrapper:
                 trade.order.auxPrice = order.auxPrice
                 trade.order.orderType = order.orderType
                 trade.order.orderRef = order.orderRef
+                if orderState.status and orderState.status != OrderStatus.PendingCancel:
+                    trade._brokerStatus = orderState.status
             else:
                 # ignore '?' values in the order
                 order = Order(
@@ -699,6 +701,7 @@ class Wrapper:
                 contract = Contract.recreate(contract)
                 orderStatus = OrderStatus(orderId=orderId, status=orderState.status)
                 trade = Trade(contract, order, orderStatus, [], [])
+                trade._brokerStatus = orderState.status
                 self.trades[key] = trade
                 self._logger.info(f"openOrder: {trade}")
 
@@ -751,6 +754,10 @@ class Wrapper:
         if trade:
             msg: str | None
             oldStatus = trade.orderStatus.status
+            if status != OrderStatus.PendingCancel:
+                # PendingCancel only echoes our own request; a refused cancel
+                # must fall back to the state the order was working in.
+                trade._brokerStatus = status
             new = dict(
                 status=status,
                 filled=filled,
@@ -1607,6 +1614,10 @@ class Wrapper:
         # 202 - Order cancelled - Reason:
 
         warningCodes = frozenset({105, 110, 165, 321, 329, 399, 404, 434, 492, 10167})
+
+        # 201 - Order rejected - Reason:
+        # 202 - Order cancelled - Reason:
+        orderEndedCodes = frozenset({201, 202})
         isWarning = errorCode in warningCodes or 2100 <= errorCode < 2200
 
         if errorCode == 110 and isRequest:
@@ -1650,15 +1661,40 @@ class Wrapper:
                 else:
                     self._endReq(reqId)
             elif trade:
-                # something is wrong with the order, cancel it
                 if advancedOrderRejectJson:
                     trade.advancedError = advancedOrderRejectJson
 
-                # Errors can mean two things:
+                # Errors can mean three things:
                 #  - new order is REJECTED
                 #  - existing order is server-canceled (DAY orders, margin problems)
-                #  - modification to *existing* order just has an update error, but the order is STILL LIVE
-                if not trade.isDone():
+                #  - modify/cancel of an *existing* order is refused, but the order is STILL LIVE
+                # 201 (rejected) and 202 (cancelled) always end the order. Any other
+                # error only ends an order that the broker has never acknowledged and
+                # that has no modify/cancel outstanding, i.e. a rejected submission.
+                # Otherwise the order may still fill, so keep the last broker status
+                # and wait for the broker to report a terminal status.
+                pendingRequests = trade._pendingRequests
+                if pendingRequests:
+                    trade._pendingRequests = pendingRequests - 1
+
+                endsOrder = errorCode in orderEndedCodes or not (
+                    trade._brokerStatus or pendingRequests
+                )
+
+                if trade.isDone():
+                    pass
+                elif not endsOrder:
+                    status = trade.orderStatus.status = (
+                        trade._brokerStatus or OrderStatus.PendingSubmit
+                    )
+                    logEntry = TradeLogEntry(self.lastTime, status, msg, errorCode)
+                    trade.log.append(logEntry)
+                    self._logger.warning(
+                        f"Order request refused, order still live: {trade}"
+                    )
+                    self.ib.orderStatusEvent.emit(trade)
+                    trade.statusEvent.emit(trade)
+                else:
                     status = trade.orderStatus.status = OrderStatus.Cancelled
                     logEntry = TradeLogEntry(self.lastTime, status, msg, errorCode)
                     trade.log.append(logEntry)

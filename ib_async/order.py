@@ -441,6 +441,13 @@ class Trade:
         self.cancelEvent = Event("cancelEvent")
         self.cancelledEvent = Event("cancelledEvent")
 
+        # Last order status reported by the broker ("" until acknowledged) and
+        # the number of modify/cancel requests not yet answered by an error.
+        # A broker error can only be attributed by orderId, so these decide
+        # whether an error rejected the order itself or only refused a request.
+        self._brokerStatus = ""
+        self._pendingRequests = 0
+
     def isWaiting(self) -> bool:
         """True if sent to IBKR but not "Submitted" for live execution yet."""
         return self.orderStatus.status in OrderStatus.WaitingStates
