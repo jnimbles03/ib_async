@@ -1330,35 +1330,37 @@ class Wrapper:
         # assert list(dom.keys()) == list(range(0, len(dom))), f"Keys aren't sequential? {dom} :: {ticker}"
         # fmt: on
 
-        if operation in {0, 1}:
+        # Positions are row indices into the book: an insert pushes the rows at
+        # and below it down by one, and a delete pulls the following rows up.
+        levels = [dom[k] for k in sorted(dom)]
+
+        if operation == 0:
             # '0' is INSERT NEW
+            if position >= 0:
+                levels.insert(position, DOMLevel(price, size, marketMaker))
+        elif operation == 1:
             # '1' is UPDATE EXISTING
-            # We are using the same operation for "insert or overwrite" directly.
-            dom[position] = DOMLevel(price, size, marketMaker)
+            level = DOMLevel(price, size, marketMaker)
+            if 0 <= position < len(levels):
+                levels[position] = level
+            elif position >= len(levels):
+                levels.append(level)
         elif operation == 2:
             # '2' is DELETE EXISTING
             size = 0
-            try:
-                level = dom.pop(position)
-                price = level.price
-            except Exception as _:
-                # invalid position requested for removal, so ignore the request
-                pass
+            if 0 <= position < len(levels):
+                price = levels.pop(position).price
 
-        # To retain the original API structure, we convert all sorted dict
-        # values into lists for users to consume.
+        # Renumber in place so the dict keys stay contiguous and in row order,
+        # and callers holding a reference to the dict see the update.
+        dom.clear()
+        dom.update(enumerate(levels))
+
         # Users can also read ticker.domBidsDict or ticker.domAsksDict directly.
-        values = list(dom.values())
         if side:
-            # Update BID for users
-            ticker.domBids = values
+            ticker.domBids = levels
         else:
-            # Update ASK for users
-            ticker.domAsks = values
-
-        # TODO: add optional debugging check. In a correctly working system, we should
-        #       technically always have sequential bid and ask position entries, but
-        #       in the past we have seen gaps or missing values.
+            ticker.domAsks = levels
 
         tick = MktDepthData(
             self.lastTime, position, marketMaker, operation, side, price, size
