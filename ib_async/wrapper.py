@@ -1258,8 +1258,10 @@ class Wrapper:
             return
 
         try:
+            # Generic ticks are signed (e.g. a discounted indexFuturePremium is
+            # negative, halted uses -1/0 as statuses), so they are not sizes
+            # and must not be replaced with the empty size.
             value = float(value)
-            value = value if value > 0 else self.defaultEmptySize
         except ValueError:
             self._logger.error(
                 f"[tickType {tickType}] genericTick: malformed value: {value!r}"
